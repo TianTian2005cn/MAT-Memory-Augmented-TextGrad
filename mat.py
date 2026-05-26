@@ -1,96 +1,137 @@
 """
-Memory-Augmented TextGrad (MAT) - 论文实验最终版（修正版）
-修正内容：
-1. 恢复旧版正确的梯度注入逻辑（set.add(tg.Variable)），避免覆盖原始梯度。
-2. 添加 Hugging Face 镜像支持，解决国内无法下载模型的问题。
-3. 将记忆检索相似度阈值降低至 0.4，提高经验召回率。
-4. 保留本地 Embedding 方案，并给出切换至 BGE-M3 API 的注释选项。
+Memory-Augmented TextGrad (MAT) for BBH / MMLU 
+=====================================================
 
-日期：2026年2月（修正于4月）
+This module adapts MAT from GSM8K-style numeric math problems to broader
+reasoning and knowledge benchmarks, including:
 
-使用方法：
-1. 设置环境变量 DEEPSEEK_API_KEY（或直接填入下方，提交前删除）
-2. pip install textgrad openai numpy sentence-transformers matplotlib
-3. python python_20260413_29bfe8_fixed.py
+- BBH / Big Bench Hard:
+  Usually free-form or exact-match tasks with fields such as input/target.
 
-输出：
-- phase2_test_results.json  : 详细测试结果
-- memory_after_training.json: 训练后的记忆库
-- comparison_plot.png       : Vanilla vs MAT 对比图
+- MMLU:
+  Multiple-choice academic questions with fields such as question, choices,
+  answer, subject.
+
+
+Core MAT idea:
+- First run native TextGrad feedback on the current task.
+- Retrieve similar successful optimization trajectories from long-term memory.
+- Inject retrieved memory as an additional TextGrad variable into the gradient
+  set. This is gradient-level memory injection, not simple prompt concatenation.
 """
 
 import os
+import re
 import json
 import time
-import re
-import numpy as np
+import math
+import random
+import hashlib
+import threading
+import string
 from dataclasses import dataclass, field, asdict
-from typing import List, Optional, Dict, Any, Tuple
+from fractions import Fraction
+from typing import List, Optional, Dict, Any, Tuple, Union
 
-# ==================== 国内网络加速：Hugging Face 镜像 ====================
-# 解决 sentence-transformers 无法从 huggingface.co 下载模型的问题
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-
-# OpenAI 兼容客户端（用于 DeepSeek）
+import numpy as np
 from openai import OpenAI
-
-# 本地 Embedding
 from sentence_transformers import SentenceTransformer
 
-# TextGrad
 import textgrad as tg
 from textgrad.engine import EngineLM
 
-# 可选绘图
-try:
-    import matplotlib.pyplot as plt
-    HAS_PLT = True
-except ImportError:
-    HAS_PLT = False
 
-# ============================================================
-# 全局配置
-# ============================================================
+# ---------------------------------------------------------------------
+# Environment and model configuration
+# ---------------------------------------------------------------------
 
-# 从环境变量读取 API Key（提交前务必删除硬编码）
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "your-deepseek-api")
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-MODEL_FORWARD = "deepseek-chat"      # 前向生成
-MODEL_BACKWARD = "deepseek-chat"     # 反向梯度
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+DEEPSEEK_BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
-# 本地 Embedding 模型（可替换为 BGE-M3 的 API 调用，见注释）
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-# 若希望使用更强大的本地模型，可改为：
-# EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+MODEL_FORWARD = os.environ.get("MODEL_FORWARD", "deepseek-v4-flash")
+MODEL_BACKWARD = os.environ.get("MODEL_BACKWARD", "deepseek-v4-flash")
 
-# 记忆检索相似度阈值（降低以提高召回）
-SIMILARITY_THRESHOLD = 0.4
+EMBEDDING_MODEL = os.environ.get(
+    "EMBEDDING_MODEL",
+    "sentence-transformers/all-MiniLM-L6-v2",
+)
 
-# ============================================================
-# DeepSeek 客户端
-# ============================================================
+SIMILARITY_THRESHOLD = float(os.environ.get("SIMILARITY_THRESHOLD", "0.4"))
+DEFAULT_TOP_K = int(os.environ.get("TOP_K_EXPERIENCES", "3"))
+
+CHOICE_LETTERS = list(string.ascii_uppercase)
+_thread_state = threading.local()
+
+
+# ---------------------------------------------------------------------
+# API utilities
+# ---------------------------------------------------------------------
+
+def _require_api_key() -> str:
+    if not DEEPSEEK_API_KEY:
+        raise RuntimeError(
+            "DEEPSEEK_API_KEY is not set. "
+            "Please set it as an environment variable before running."
+        )
+    return DEEPSEEK_API_KEY
+
 
 def get_deepseek_client() -> OpenAI:
-    return OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
-
-# 全局客户端（用于初始解生成等）
-GLOBAL_CLIENT = get_deepseek_client()
-
-# ============================================================
-# TextGrad 自定义 Engine
-# ============================================================
-
-class DeepSeekEngine(EngineLM):
-    """将 DeepSeek 包装为 TextGrad Engine"""
-    DEFAULT_SYSTEM_PROMPT = (
-        "You are a helpful assistant that carefully analyzes problems "
-        "and provides constructive, detailed feedback."
+    return OpenAI(
+        api_key=_require_api_key(),
+        base_url=DEEPSEEK_BASE_URL,
     )
 
-    def __init__(self, model_string: str = MODEL_BACKWARD,
-                 system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-                 temperature: float = 0.0, max_tokens: int = 4096):
+
+def _begin_api_count() -> None:
+    _thread_state.api_calls = 0
+
+
+def _inc_api_count() -> None:
+    if not hasattr(_thread_state, "api_calls"):
+        _thread_state.api_calls = 0
+    _thread_state.api_calls += 1
+
+
+def _get_api_count() -> int:
+    return int(getattr(_thread_state, "api_calls", 0))
+
+
+def chat_completion(
+    messages: List[Dict[str, str]],
+    model: str = MODEL_FORWARD,
+    temperature: float = 0.0,
+    max_tokens: int = 2048,
+) -> str:
+    client = get_deepseek_client()
+    _inc_api_count()
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+    return resp.choices[0].message.content or ""
+
+
+class DeepSeekEngine(EngineLM):
+    DEFAULT_SYSTEM_PROMPT = (
+        "You are a careful reasoning evaluator. "
+        "Evaluate whether the candidate solution correctly answers the task. "
+        "Give concise, actionable feedback for improvement."
+    )
+
+    def __init__(
+        self,
+        model_string: str = MODEL_BACKWARD,
+        system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+    ):
         self.model_string = model_string
         self.system_prompt = system_prompt
         self.temperature = temperature
@@ -100,6 +141,7 @@ class DeepSeekEngine(EngineLM):
 
     def generate(self, content, system_prompt=None, **kwargs):
         sys_prompt = system_prompt or self.system_prompt
+
         if isinstance(content, str):
             messages = [
                 {"role": "system", "content": sys_prompt},
@@ -107,31 +149,415 @@ class DeepSeekEngine(EngineLM):
             ]
         else:
             messages = content
+
+        _inc_api_count()
+
         resp = self.client.chat.completions.create(
             model=self.model_string,
             messages=messages,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
         )
-        return resp.choices[0].message.content
+
+        return resp.choices[0].message.content or ""
 
     def __call__(self, *args, **kwargs):
         return self.generate(*args, **kwargs)
 
-def setup_textgrad_with_deepseek():
+
+def setup_textgrad_with_deepseek() -> DeepSeekEngine:
     engine = DeepSeekEngine()
     tg.set_backward_engine(engine, override=True)
     return engine
 
-# ============================================================
-# 数据结构
-# ============================================================
+
+# ---------------------------------------------------------------------
+# Data loading and benchmark adaptation
+# ---------------------------------------------------------------------
+
+def load_problem_file(path: str) -> List[Dict[str, Any]]:
+    """
+    Load problems from .json or .jsonl.
+
+    Supported JSON shapes:
+    - list[dict]
+    - {"data": list[dict]}
+    - {"examples": list[dict]}
+    - {"questions": list[dict]}
+    """
+    if path.endswith(".jsonl"):
+        rows = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+        return rows
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        for key in ["data", "examples", "questions", "items", "records"]:
+            if key in data and isinstance(data[key], list):
+                return data[key]
+
+    raise ValueError(f"Unsupported data format in file: {path}")
+
+
+def save_json(data: Any, path: str) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+
+def _lower_set(csv: Optional[str]) -> Optional[set]:
+    if not csv:
+        return None
+    return {x.strip().lower() for x in csv.split(",") if x.strip()}
+
+
+def filter_problems(
+    problems: List[Dict[str, Any]],
+    include_subjects: Optional[str] = None,
+    include_categories: Optional[str] = None,
+    include_tasks: Optional[str] = None,
+    limit: Optional[int] = None,
+    shuffle: bool = False,
+    seed: int = 42,
+) -> List[Dict[str, Any]]:
+    """
+    Filter examples for MMLU / BBH style metadata.
+
+    Examples:
+    - MMLU physics:
+      include_subjects="high_school_physics,college_physics"
+
+    - BBH selected tasks:
+      include_tasks="date_understanding,boolean_expressions"
+    """
+    subj_set = _lower_set(include_subjects)
+    cat_set = _lower_set(include_categories)
+    task_set = _lower_set(include_tasks)
+
+    output = []
+
+    for p in problems:
+        n = normalize_problem(p)
+
+        subject = str(n["metadata"].get("subject", "")).lower()
+        category = str(n["metadata"].get("category", "")).lower()
+        task = str(n["metadata"].get("task", "")).lower()
+
+        if subj_set and subject not in subj_set:
+            continue
+
+        if cat_set:
+            joined = f"{category} {subject} {task}".lower()
+            if not any(c in joined for c in cat_set):
+                continue
+
+        if task_set and task not in task_set:
+            continue
+
+        output.append(p)
+
+    if shuffle:
+        rng = random.Random(seed)
+        rng.shuffle(output)
+
+    if limit is not None and limit > 0:
+        output = output[:limit]
+
+    return output
+
+
+def _first_existing(d: Dict[str, Any], keys: List[str], default=None):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return default
+
+
+def _normalize_choices(raw_choices: Any) -> List[str]:
+    if raw_choices is None:
+        return []
+
+    if isinstance(raw_choices, list):
+        out = []
+        for c in raw_choices:
+            if isinstance(c, dict):
+                val = _first_existing(c, ["text", "content", "answer", "choice", "label"], "")
+                out.append(str(val))
+            else:
+                out.append(str(c))
+        return out
+
+    if isinstance(raw_choices, dict):
+        ordered = []
+        for letter in CHOICE_LETTERS:
+            if letter in raw_choices:
+                ordered.append(str(raw_choices[letter]))
+            elif letter.lower() in raw_choices:
+                ordered.append(str(raw_choices[letter.lower()]))
+        if ordered:
+            return ordered
+        return [str(v) for _, v in sorted(raw_choices.items())]
+
+    return []
+
+
+def _stable_shuffle_options(question: str, options: List[str]) -> List[str]:
+    seed = int(hashlib.sha256(question.encode("utf-8")).hexdigest()[:8], 16)
+    rng = random.Random(seed)
+    copied = list(options)
+    rng.shuffle(copied)
+    return copied
+
+
+def _answer_to_letter(answer: Any, choices: List[str]) -> Optional[str]:
+    if answer is None:
+        return None
+
+    n = len(choices)
+    if n <= 0:
+        return None
+
+    # Integer index, common in MMLU: 0,1,2,3
+    if isinstance(answer, int):
+        if 0 <= answer < n:
+            return CHOICE_LETTERS[answer]
+        if 1 <= answer <= n:
+            return CHOICE_LETTERS[answer - 1]
+
+    ans = str(answer).strip()
+
+    # Letter
+    if len(ans) == 1 and ans.upper() in CHOICE_LETTERS[:n]:
+        return ans.upper()
+
+    # Numeric string index
+    if re.fullmatch(r"\d+", ans):
+        idx = int(ans)
+        if 0 <= idx < n:
+            return CHOICE_LETTERS[idx]
+        if 1 <= idx <= n:
+            return CHOICE_LETTERS[idx - 1]
+
+    # Match option text
+    ans_norm = normalize_text(ans)
+    for i, c in enumerate(choices):
+        if normalize_text(c) == ans_norm:
+            return CHOICE_LETTERS[i]
+
+    return None
+
+
+def normalize_problem(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert BBH / MMLU  examples into a unified schema.
+
+    Unified schema:
+    {
+      "question": str,
+      "answer": str,
+      "answer_type": "mcq" | "numeric" | "exact",
+      "choices": list[str],
+      "metadata": {...},
+      "raw": original dict
+    }
+    """
+    # Common metadata
+    subject = _first_existing(
+        raw,
+        ["subject", "Subject", "mmlu_subject", "subdomain", "Subdomain"],
+        "",
+    )
+    category = _first_existing(
+        raw,
+        ["category", "Category", "discipline", "Discipline", "domain", "Domain"],
+        "",
+    )
+    task = _first_existing(
+        raw,
+        ["task", "Task", "task_name", "bbh_task", "name"],
+        "",
+    )
+    benchmark = _first_existing(
+        raw,
+        ["benchmark", "dataset", "source", "src"],
+        "",
+    )
+
+    correct_answer = _first_existing(
+        raw,
+        [
+            "Correct Answer",
+            "correct_answer",
+            "correct",
+            "answer_correct",
+            "gold",
+        ],
+        None,
+    )
+
+    incorrects = []
+    for k in [
+        "Incorrect Answer 1",
+        "Incorrect Answer 2",
+        "Incorrect Answer 3",
+        "incorrect_answer_1",
+        "incorrect_answer_2",
+        "incorrect_answer_3",
+        "incorrect1",
+        "incorrect2",
+        "incorrect3",
+    ]:
+        if k in raw and raw[k]:
+            incorrects.append(str(raw[k]))
+
+    # Question field
+    question = _first_existing(
+        raw,
+        [
+            "question",
+            "Question",
+            "input",
+            "prompt",
+            "query",
+            "problem",
+            "stem",
+        ],
+        "",
+    )
+    question = str(question).strip()
+
+    # Choices
+    choices = _normalize_choices(
+        _first_existing(
+            raw,
+            ["choices", "options", "Options", "answer_choices", "candidate_answers"],
+            None,
+        )
+    )
+
+    if correct_answer is not None and incorrects and not choices:
+        all_options = [str(correct_answer)] + incorrects
+        choices = _stable_shuffle_options(question, all_options)
+        answer = _answer_to_letter(str(correct_answer), choices)
+        answer_type = "mcq"
+    else:
+        answer = _first_existing(
+            raw,
+            [
+                "answer",
+                "Answer",
+                "target",
+                "targets",
+                "label",
+                "gold_answer",
+                "correct",
+            ],
+            correct_answer,
+        )
+
+        if isinstance(answer, list):
+            answer = answer[0] if answer else ""
+
+        if choices:
+            letter = _answer_to_letter(answer, choices)
+            answer = letter if letter is not None else str(answer)
+            answer_type = "mcq"
+        else:
+            answer = str(answer).strip()
+            if looks_numeric(answer):
+                answer_type = "numeric"
+            else:
+                answer_type = "exact"
+
+    formatted_question = format_question_for_model(
+        question=question,
+        choices=choices,
+        metadata={
+            "subject": subject,
+            "category": category,
+            "task": task,
+            "benchmark": benchmark,
+        },
+    )
+
+    return {
+        "question": formatted_question,
+        "raw_question": question,
+        "answer": str(answer).strip(),
+        "answer_type": answer_type,
+        "choices": choices,
+        "metadata": {
+            "subject": str(subject),
+            "category": str(category),
+            "task": str(task),
+            "benchmark": str(benchmark),
+        },
+        "raw": raw,
+    }
+
+
+def format_question_for_model(
+    question: str,
+    choices: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> str:
+    metadata = metadata or {}
+    parts = []
+
+    subject = metadata.get("subject", "")
+    category = metadata.get("category", "")
+    task = metadata.get("task", "")
+
+    meta_line = []
+    if subject:
+        meta_line.append(f"Subject: {subject}")
+    if category:
+        meta_line.append(f"Category: {category}")
+    if task:
+        meta_line.append(f"Task: {task}")
+
+    if meta_line:
+        parts.append(" | ".join(meta_line))
+
+    parts.append(str(question).strip())
+
+    if choices:
+        parts.append("Choices:")
+        for i, c in enumerate(choices):
+            if i >= len(CHOICE_LETTERS):
+                break
+            parts.append(f"{CHOICE_LETTERS[i]}. {c}")
+
+    return "\n".join(parts).strip()
+
+
+def get_problem_id(problem: Union[Dict[str, Any], str]) -> str:
+    if isinstance(problem, str):
+        text = problem.strip()
+    else:
+        n = normalize_problem(problem)
+        text = n["question"].strip()
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------
+# Experience memory
+# ---------------------------------------------------------------------
 
 @dataclass
 class OptimizationExperience:
     problem_id: str
     problem_text: str
     problem_type: str = ""
+    answer_type: str = ""
     initial_solution: str = ""
     final_solution: str = ""
     textual_gradients: List[str] = field(default_factory=list)
@@ -139,499 +565,1131 @@ class OptimizationExperience:
     num_iterations: int = 0
     success: bool = False
     improvement_score: float = 0.0
+    metadata: Dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
     @classmethod
-    def from_dict(cls, data):
-        return cls(**data)
+    def from_dict(cls, data: Dict[str, Any]):
+        allowed = set(cls.__dataclass_fields__.keys())
+        clean = {k: v for k, v in data.items() if k in allowed}
+        return cls(**clean)
 
-# ============================================================
-# 记忆模块（本地 embedding）
-# ============================================================
 
 class ExperienceMemory:
-    def __init__(self, capacity: int = 1000,
-                 embedding_model: str = EMBEDDING_MODEL,
-                 similarity_threshold: float = SIMILARITY_THRESHOLD):
+    def __init__(
+        self,
+        capacity: int = 3000,
+        embedding_model: str = EMBEDDING_MODEL,
+        similarity_threshold: float = SIMILARITY_THRESHOLD,
+    ):
         self.capacity = capacity
         self.similarity_threshold = similarity_threshold
+
         self.experiences: List[OptimizationExperience] = []
         self.embeddings: List[np.ndarray] = []
-        self.stats = {"total_stored": 0, "total_retrieved": 0, "cache_hits": 0}
+
+        self.stats = {
+            "total_stored": 0,
+            "total_retrieved": 0,
+            "cache_hits": 0,
+            "duplicate_skipped": 0,
+        }
+
         self._embedding_cache: Dict[str, np.ndarray] = {}
-        print(f"[Memory] Loading embedding model: {embedding_model}")
+        self._seen_problem_ids = set()
         self._embedder = SentenceTransformer(embedding_model)
+        self.lock = threading.RLock()
+
+    @staticmethod
+    def problem_id(text: str) -> str:
+        return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+    def _memory_text(self, exp: OptimizationExperience) -> str:
+        return (
+            f"Problem type: {exp.problem_type}\n"
+            f"Answer type: {exp.answer_type}\n"
+            f"Metadata: {json.dumps(exp.metadata, ensure_ascii=False)}\n"
+            f"Problem:\n{exp.problem_text}\n"
+            f"Reusable insight:\n{exp.key_insight}\n"
+            f"Final solution sketch:\n{exp.final_solution[:1000]}"
+        )
+
+    def _query_text(self, problem_text: str) -> str:
+        return (
+            f"Problem type: {infer_problem_type(problem_text)}\n"
+            f"Problem:\n{problem_text}"
+        )
 
     def _get_embedding(self, text: str) -> np.ndarray:
-        text = text[:2000]
-        cache_key = hash(text)
-        if cache_key in self._embedding_cache:
-            self.stats["cache_hits"] += 1
-            return self._embedding_cache[cache_key]
+        text = text[:4000]
+        cache_key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+        with self.lock:
+            if cache_key in self._embedding_cache:
+                self.stats["cache_hits"] += 1
+                return self._embedding_cache[cache_key]
+
         emb = self._embedder.encode(text, normalize_embeddings=True)
-        self._embedding_cache[cache_key] = emb
+
+        with self.lock:
+            self._embedding_cache[cache_key] = emb
+
         return emb
 
     def store(self, experience: OptimizationExperience) -> bool:
         if not experience.success:
             return False
-        if len(self.experiences) >= self.capacity:
-            self.experiences.pop(0)
-            self.embeddings.pop(0)
-        emb = self._get_embedding(experience.problem_text)
-        self.experiences.append(experience)
-        self.embeddings.append(emb)
-        self.stats["total_stored"] += 1
+
+        if not experience.problem_id:
+            experience.problem_id = self.problem_id(experience.problem_text)
+
+        with self.lock:
+            if experience.problem_id in self._seen_problem_ids:
+                self.stats["duplicate_skipped"] += 1
+                return False
+
+            if len(self.experiences) >= self.capacity:
+                old = self.experiences.pop(0)
+                self.embeddings.pop(0)
+                self._seen_problem_ids.discard(old.problem_id)
+
+            emb = self._get_embedding(self._memory_text(experience))
+
+            self.experiences.append(experience)
+            self.embeddings.append(emb)
+            self._seen_problem_ids.add(experience.problem_id)
+            self.stats["total_stored"] += 1
+
         return True
 
-    def retrieve(self, query_problem: str, top_k: int = 3,
-                 min_similarity: Optional[float] = None) -> Tuple[List[OptimizationExperience], List[float]]:
-        if not self.embeddings:
-            return [], []
-        min_sim = min_similarity or self.similarity_threshold
-        query_emb = self._get_embedding(query_problem)
-        emb_matrix = np.stack(self.embeddings)
-        similarities = emb_matrix @ query_emb
-        valid_idx = np.where(similarities >= min_sim)[0]
+    def retrieve(
+        self,
+        query_problem: str,
+        top_k: int = DEFAULT_TOP_K,
+        min_similarity: Optional[float] = None,
+    ) -> Tuple[List[OptimizationExperience], List[float]]:
+        threshold = self.similarity_threshold if min_similarity is None else min_similarity
+
+        with self.lock:
+            if not self.embeddings:
+                return [], []
+
+            embeddings = np.stack(self.embeddings)
+            experiences = list(self.experiences)
+
+        query_emb = self._get_embedding(self._query_text(query_problem))
+        similarities = embeddings @ query_emb
+        valid_idx = np.where(similarities >= threshold)[0]
+
         if len(valid_idx) == 0:
             return [], []
+
         sorted_idx = valid_idx[np.argsort(similarities[valid_idx])[::-1]]
         top_idx = sorted_idx[:top_k]
-        exps = [self.experiences[i] for i in top_idx]
-        sims = [similarities[i] for i in top_idx]
-        self.stats["total_retrieved"] += len(exps)
+
+        exps = [experiences[i] for i in top_idx]
+        sims = [float(similarities[i]) for i in top_idx]
+
+        with self.lock:
+            self.stats["total_retrieved"] += len(exps)
+
         return exps, sims
 
-    def save(self, filepath: str):
-        data = {
-            "experiences": [e.to_dict() for e in self.experiences],
-            "embeddings": [e.tolist() for e in self.embeddings],
-            "stats": self.stats
-        }
+    def save(self, filepath: str) -> None:
+        with self.lock:
+            data = {
+                "capacity": self.capacity,
+                "similarity_threshold": self.similarity_threshold,
+                "experiences": [e.to_dict() for e in self.experiences],
+                "embeddings": [e.tolist() for e in self.embeddings],
+                "stats": self.stats,
+            }
+
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
 
-    def load(self, filepath: str):
+    def load(self, filepath: str) -> None:
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
-        self.experiences = [OptimizationExperience.from_dict(e) for e in data["experiences"]]
-        self.embeddings = [np.array(e) for e in data["embeddings"]]
-        self.stats = data["stats"]
 
-# ============================================================
-# 记忆增强优化器（修正版：恢复正确的梯度注入逻辑）
-# ============================================================
+        with self.lock:
+            self.capacity = int(data.get("capacity", self.capacity))
+            self.similarity_threshold = float(
+                data.get("similarity_threshold", self.similarity_threshold)
+            )
+            self.experiences = [
+                OptimizationExperience.from_dict(e)
+                for e in data.get("experiences", [])
+            ]
+            self.embeddings = [np.array(e) for e in data.get("embeddings", [])]
+            self.stats = data.get("stats", self.stats)
+            self._seen_problem_ids = {e.problem_id for e in self.experiences}
+
+
+# ---------------------------------------------------------------------
+# MAT optimizer
+# ---------------------------------------------------------------------
 
 class MemoryAugmentedTGD:
-    def __init__(self, parameters: List[tg.Variable], memory: ExperienceMemory,
-                 learning_rate: float = 1.0, top_k_experiences: int = 1,
-                 augmentation_mode: str = "append", sim_threshold: float = SIMILARITY_THRESHOLD):
+    def __init__(
+        self,
+        parameters,
+        memory: Optional[ExperienceMemory],
+        top_k_experiences: int = DEFAULT_TOP_K,
+        sim_threshold: float = SIMILARITY_THRESHOLD,
+        use_retrieval: bool = True,
+        use_adaptive_iter: bool = True,
+        use_gradient_injection: bool = True,
+    ):
         self.parameters = parameters
         self.memory = memory
-        self.learning_rate = learning_rate
         self.top_k = top_k_experiences
-        self.augmentation_mode = augmentation_mode
         self.sim_threshold = sim_threshold
+
+        self.use_retrieval = use_retrieval
+        self.use_adaptive_iter = use_adaptive_iter
+        self.use_gradient_injection = use_gradient_injection
+
         self.base_optimizer = tg.TGD(parameters=parameters)
+
         self.current_problem: Optional[str] = None
+        self.current_answer_type: str = ""
+        self.current_metadata: Dict[str, Any] = {}
+
         self.gradient_history: List[str] = []
         self.retrieved_experiences: List[OptimizationExperience] = []
         self.retrieved_similarities: List[float] = []
+        self.predicted_iters: Optional[int] = None
 
-    def set_problem(self, problem_text: str):
+    def set_problem(
+        self,
+        problem_text: str,
+        answer_type: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self.current_problem = problem_text
+        self.current_answer_type = answer_type
+        self.current_metadata = metadata or {}
+
         self.gradient_history = []
-        if len(self.memory.experiences) > 0:
+        self.retrieved_experiences = []
+        self.retrieved_similarities = []
+        self.predicted_iters = None
+
+        if self.use_retrieval and self.memory is not None:
             exps, sims = self.memory.retrieve(
-                problem_text, top_k=self.top_k,
-                min_similarity=self.sim_threshold
+                query_problem=problem_text,
+                top_k=self.top_k,
+                min_similarity=self.sim_threshold,
             )
             self.retrieved_experiences = exps
             self.retrieved_similarities = sims
-        else:
-            self.retrieved_experiences = []
-            self.retrieved_similarities = []
+
+        if self.use_adaptive_iter and self.retrieved_experiences:
+            self.predicted_iters = self.predict_required_iterations()
 
     def predict_required_iterations(self) -> int:
         if not self.retrieved_experiences:
             return 3
-        sim = self.retrieved_similarities[0]
-        if sim > 0.6:
-            return max(1, min(self.retrieved_experiences[0].num_iterations, 5))
-        return 3
 
-    def _format_experience_context(self) -> str:
+        weights = np.array(self.retrieved_similarities, dtype=float)
+        iters = np.array(
+            [max(1, int(e.num_iterations)) for e in self.retrieved_experiences],
+            dtype=float,
+        )
+
+        if weights.sum() <= 0:
+            return 3
+
+        pred = int(round(float(np.average(iters, weights=weights))))
+        return int(np.clip(pred, 1, 5))
+
+    def _format_memory_gradient(self) -> str:
         if not self.retrieved_experiences:
             return ""
-        insight = self.retrieved_experiences[0].key_insight
-        if not insight:
+
+        parts = []
+
+        for rank, (exp, sim) in enumerate(
+            zip(self.retrieved_experiences, self.retrieved_similarities),
+            start=1,
+        ):
+            if not exp.key_insight:
+                continue
+
+            parts.append(
+                f"[Retrieved experience #{rank}; similarity={sim:.3f}; "
+                f"type={exp.problem_type}; answer_type={exp.answer_type}] "
+                f"{exp.key_insight[:700]}"
+            )
+
+        if not parts:
             return ""
-        return f"\n[Relevant past strategy (sim={self.retrieved_similarities[0]:.2f}): {insight[:200]}]"
 
-    def step(self):
+        return (
+            "Memory-augmented textual gradient guidance:\n"
+            "Use these retrieved successful trajectories as additional optimization "
+            "signals. They may reveal common traps, answer-format constraints, "
+            "or reasoning strategies for similar tasks.\n"
+            + "\n".join(parts)
+        )
+
+    @staticmethod
+    def _gradient_to_text(gradients) -> str:
+        if gradients is None:
+            return ""
+
+        if isinstance(gradients, (set, list, tuple)):
+            return " ".join(str(getattr(g, "value", g)) for g in gradients)
+
+        return str(getattr(gradients, "value", gradients))
+
+    def step(self) -> None:
         for param in self.parameters:
-            if hasattr(param, "gradients") and param.gradients is not None:
-                # 保存原始梯度文本（用于记录历史，不破坏原结构）
-                if isinstance(param.gradients, (set, list)):
-                    grad_texts = []
-                    for g in param.gradients:
-                        if hasattr(g, 'value'):
-                            grad_texts.append(str(g.value))
+            if not hasattr(param, "gradients") or param.gradients is None:
+                continue
+
+            original_gradient = self._gradient_to_text(param.gradients)
+            self.gradient_history.append(original_gradient)
+
+            if self.use_gradient_injection and self.retrieved_experiences:
+                memory_gradient_text = self._format_memory_gradient()
+
+                if memory_gradient_text:
+                    memory_gradient_var = tg.Variable(
+                        memory_gradient_text,
+                        role_description=(
+                            "retrieved long-term memory as an additional textual gradient"
+                        ),
+                        requires_grad=False,
+                    )
+
+                    if not isinstance(param.gradients, set):
+                        if isinstance(param.gradients, list):
+                            param.gradients = set(param.gradients)
                         else:
-                            grad_texts.append(str(g))
-                    original_gradient = " ".join(grad_texts)
-                else:
-                    original_gradient = str(getattr(param.gradients, 'value', param.gradients))
+                            param.gradients = {param.gradients}
 
-                self.gradient_history.append(original_gradient)
+                    param.gradients.add(memory_gradient_var)
 
-                # 记忆增强：向原有的 set 中添加新的梯度 Variable，而不是替换整个 set
-                if self.retrieved_experiences:
-                    ctx = self._format_experience_context()
-                    if ctx:
-                        augmented_text = original_gradient + ctx
-                        augmented_var = tg.Variable(
-                            augmented_text,
-                            role_description="augmented textual gradient",
-                            requires_grad=False
-                        )
-                        # 确保 gradients 是 set 类型
-                        if not isinstance(param.gradients, set):
-                            # 如果原本不是 set，转换为包含原内容的 set
-                            param.gradients = set(param.gradients) if isinstance(param.gradients, list) else {param.gradients}
-                        # 将增强后的梯度添加到 set 中
-                        param.gradients.add(augmented_var)
-
-        # 调用基础优化器（它会正确处理 set 类型的 gradients）
         self.base_optimizer.step()
 
-    def record_success(self, final_solution: str, initial_solution: str):
-        if not self.current_problem:
-            return
-        key_insight = self.gradient_history[-1][:300] if self.gradient_history else "Correct reasoning"
+    def record_success(
+        self,
+        final_solution: str,
+        initial_solution: str,
+    ) -> bool:
+        if not self.current_problem or self.memory is None:
+            return False
+
+        insight = extract_reusable_insight(
+            problem=self.current_problem,
+            answer_type=self.current_answer_type,
+            metadata=self.current_metadata,
+            initial_solution=initial_solution,
+            final_solution=final_solution,
+            textual_gradients=self.gradient_history,
+        )
+
         exp = OptimizationExperience(
-            problem_id=str(hash(self.current_problem)),
+            problem_id=ExperienceMemory.problem_id(self.current_problem),
             problem_text=self.current_problem,
-            problem_type=infer_problem_type(self.current_problem),
+            problem_type=infer_problem_type(self.current_problem, self.current_metadata),
+            answer_type=self.current_answer_type,
             initial_solution=initial_solution,
             final_solution=final_solution,
             textual_gradients=self.gradient_history.copy(),
-            key_insight=key_insight,
+            key_insight=insight,
             num_iterations=len(self.gradient_history),
             success=True,
-            improvement_score=1.0
+            improvement_score=1.0,
+            metadata=self.current_metadata,
         )
-        self.memory.store(exp)
 
-# ============================================================
-# 辅助函数
-# ============================================================
+        return self.memory.store(exp)
 
-def infer_problem_type(question: str) -> str:
+
+# ---------------------------------------------------------------------
+# Reasoning type, loss, generation
+# ---------------------------------------------------------------------
+
+def infer_problem_type(
+    question: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> str:
+    metadata = metadata or {}
+
+    subject = str(metadata.get("subject", "")).lower()
+    category = str(metadata.get("category", "")).lower()
+    task = str(metadata.get("task", "")).lower()
+
+    joined_meta = f"{subject} {category} {task}".strip()
+    if joined_meta:
+        if "physics" in joined_meta:
+            return "science_physics"
+        if "biology" in joined_meta:
+            return "science_biology"
+        if "chemistry" in joined_meta:
+            return "science_chemistry"
+        if "date" in joined_meta:
+            return "bbh_date_understanding"
+        if "boolean" in joined_meta:
+            return "bbh_boolean_logic"
+        if "causal" in joined_meta:
+            return "bbh_causal_judgment"
+        if "dyck" in joined_meta:
+            return "bbh_formal_language"
+        if "tracking" in joined_meta:
+            return "bbh_object_tracking"
+
     q = question.lower()
-    if any(k in q for k in ['egg', 'duck', 'chicken', 'feed', 'crayon', 'muffin', 'apple']):
-        return "arithmetic"
-    elif any(k in q for k in ['meter', 'mile', 'hour', 'speed', 'travel', 'mph', 'km']):
-        return "distance_rate_time"
-    elif any(k in q for k in ['buy', 'sell', 'cost', 'price', 'profit', 'dollar', '$']):
-        return "finance"
-    elif any(k in q for k in ['box', 'pack', 'group', 'share', 'divide']):
-        return "grouping"
-    elif any(k in q for k in ['fence', 'area', 'perimeter', 'rectangle', 'garden']):
-        return "geometry"
-    else:
-        return "general_math"
 
-def create_loss_function() -> tg.TextLoss:
-    instruction = """
-    Evaluate the following mathematical solution.
-    Check for correctness, reasoning, and calculation errors.
-    If incorrect, explain flaws. If correct, confirm it.
-    """
+    if any(w in q for w in ["force", "velocity", "acceleration", "energy", "momentum", "charge", "field"]):
+        return "science_physics"
+
+    if any(w in q for w in ["cell", "gene", "protein", "enzyme", "organism", "evolution", "dna", "rna"]):
+        return "science_biology"
+
+    if any(w in q for w in ["molecule", "reaction", "acid", "base", "compound", "electron", "bond"]):
+        return "science_chemistry"
+
+    if any(w in q for w in ["true", "false", "and", "or", "not"]):
+        return "logic_boolean"
+
+    if any(w in q for w in ["date", "day", "month", "year"]):
+        return "date_reasoning"
+
+    if any(w in q for w in ["choose", "which of the following", "choices:"]):
+        return "multiple_choice_reasoning"
+
+    if any(w in q for w in ["calculate", "compute", "how many", "what is the value"]):
+        return "quantitative_reasoning"
+
+    return "general_reasoning"
+
+
+def create_loss_function(answer_type: str = "exact") -> tg.TextLoss:
+    instruction = f"""
+Evaluate the candidate solution for this benchmark task.
+
+Answer type: {answer_type}
+
+Check:
+1. Whether the reasoning is faithful to the question.
+2. Whether the candidate selected or produced the correct final answer.
+3. Whether there are hidden traps, distractors, unit errors, or logical errors.
+4. For multiple-choice tasks, the final answer must be a single option letter.
+5. For exact-match tasks, the final answer should match the required target.
+6. If incorrect, provide specific actionable feedback for the next optimization step.
+7. If correct, confirm briefly.
+
+The feedback will be used as a TextGrad textual gradient.
+"""
     return tg.TextLoss(instruction)
 
-def generate_initial_solution(question: str) -> str:
-    try:
-        resp = GLOBAL_CLIENT.chat.completions.create(
-            model=MODEL_FORWARD,
-            messages=[
-                {"role": "system", "content": "You are a math tutor. Solve step by step."},
-                {"role": "user", "content": question}
-            ],
-            temperature=0.7,
-            max_tokens=2048
+
+def generate_initial_solution(
+    problem_or_question: Union[Dict[str, Any], str],
+    temperature: float = 0.0,
+) -> str:
+    if isinstance(problem_or_question, dict):
+        p = normalize_problem(problem_or_question)
+        question = p["question"]
+        answer_type = p["answer_type"]
+    else:
+        question = str(problem_or_question)
+        answer_type = "exact"
+
+    if answer_type == "mcq":
+        final_instruction = (
+            "Solve carefully. End with exactly one line: Final answer: <letter>. "
+            "The letter must be one of the provided choices."
         )
-        return resp.choices[0].message.content.strip()
+    elif answer_type == "numeric":
+        final_instruction = (
+            "Solve carefully. End with exactly one line: Final answer: <number>."
+        )
+    else:
+        final_instruction = (
+            "Solve carefully. End with exactly one line: Final answer: <short answer>."
+        )
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a careful benchmark-solving assistant. "
+                "Reason step by step, avoid overconfidence, and follow the required answer format. "
+                + final_instruction
+            ),
+        },
+        {"role": "user", "content": question},
+    ]
+
+    try:
+        return chat_completion(
+            messages=messages,
+            model=MODEL_FORWARD,
+            temperature=temperature,
+            max_tokens=2048,
+        ).strip()
     except Exception as e:
-        return f"Error: {e}"
+        return f"Error while generating initial solution: {e}"
 
-def extract_numbers(text: str):
-    nums = re.findall(r'-?\d+\.?\d*', text)
-    return [float(n) for n in nums if n.strip()]
 
-def check_answer(solution: str, ground_truth: str) -> bool:
-    nums_sol = extract_numbers(solution)
-    nums_gt = extract_numbers(ground_truth)
-    if not nums_sol or not nums_gt:
+def extract_reusable_insight(
+    problem: str,
+    answer_type: str,
+    metadata: Dict[str, Any],
+    initial_solution: str,
+    final_solution: str,
+    textual_gradients: List[str],
+    use_llm: bool = False,
+) -> str:
+    if not use_llm:
+        last_grad = textual_gradients[-1].strip() if textual_gradients else ""
+        if last_grad:
+            return last_grad[:700]
+
+        ptype = infer_problem_type(problem, metadata)
+        return (
+            f"For {ptype} / {answer_type} tasks, identify the target, check "
+            "distractors, preserve answer format, and verify the final response."
+        )
+
+    prompt = f"""
+Summarize the reusable optimization insight from this successful MAT trajectory.
+
+Metadata:
+{json.dumps(metadata, ensure_ascii=False)}
+
+Answer type:
+{answer_type}
+
+Problem:
+{problem}
+
+Initial solution:
+{initial_solution[:1000]}
+
+Final correct solution:
+{final_solution[:1000]}
+
+Recent textual gradients:
+{chr(10).join(textual_gradients[-3:])[:2000]}
+
+Return one concise reusable strategy sentence.
+"""
+
+    try:
+        return chat_completion(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You extract concise reusable benchmark-solving strategies.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            model=MODEL_FORWARD,
+            temperature=0.0,
+            max_tokens=256,
+        ).strip()
+    except Exception:
+        return "Check the task type, avoid distractors, and follow the required final-answer format."
+
+
+# ---------------------------------------------------------------------
+# Answer extraction and checking
+# ---------------------------------------------------------------------
+
+def normalize_text(s: str) -> str:
+    """
+    Normalize text for answer comparison.
+
+    Designed for:
+    - BBH exact answers
+    - MMLU option text comparison
+    - short free-form answers
+    """
+    s = "" if s is None else str(s)
+    s = s.strip().lower()
+
+    # Remove markdown/code/latex-ish wrappers
+    s = s.replace("```", " ")
+    s = re.sub(r"\\boxed\s*\{([^{}]+)\}", r"\1", s)
+    s = re.sub(r"\\\((.*?)\\\)", r"\1", s)
+    s = re.sub(r"\\\[(.*?)\\\]", r"\1", s)
+
+    # Remove common final-answer prefixes
+    s = re.sub(
+        r"^(final\s+answer|answer|the\s+answer\s+is|therefore\s*,?\s*the\s+answer\s+is|答案|最终答案)\s*[:：=\-]*\s*",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove leading option markers: A. xxx / (A) xxx / A) xxx
+    s = re.sub(r"^\(?[a-z]\)?[\.\):：]\s+", "", s)
+
+    # Normalize quotes and punctuation
+    s = s.replace("“", "\"").replace("”", "\"").replace("‘", "'").replace("’", "'")
+    s = s.strip(" \t\n\r.。,:;；!！?？\"'`")
+
+    # Normalize articles lightly for English exact match
+    s = re.sub(r"\b(a|an|the)\b", " ", s)
+
+    # Normalize spaces
+    s = re.sub(r"\s+", " ", s).strip()
+
+    return s
+
+
+def looks_numeric(text: str) -> bool:
+    text = str(text).strip()
+    if not text:
         return False
-    return abs(nums_sol[-1] - nums_gt[-1]) < 0.01
 
-# ============================================================
-# 单题运行
-# ============================================================
+    return bool(
+        re.search(
+            r"[-+]?\$?\d[\d,]*(?:\.\d+)?(?:\s*/\s*[-+]?\d[\d,]*)?%?",
+            text,
+        )
+    )
 
-def run_single_problem(problem: dict, method: str,
-                       memory: Optional[ExperienceMemory],
-                       max_iterations: int = 5,
-                       is_training: bool = False) -> dict:
-    question = problem["question"]
-    ground_truth = problem["answer"]
 
+def _clean_number_string(s: str) -> str:
+    return s.replace(",", "").replace("$", "").replace("%", "").strip()
+
+
+def _to_float_maybe(s: str) -> Optional[float]:
+    s = _clean_number_string(str(s))
+
+    if not s:
+        return None
+
+    try:
+        if "/" in s and re.fullmatch(r"[-+]?\d+\s*/\s*[-+]?\d+", s):
+            return float(Fraction(s.replace(" ", "")))
+        return float(s)
+    except Exception:
+        return None
+
+
+def extract_final_number(text: str) -> Optional[float]:
+    if not text:
+        return None
+
+    patterns = [
+        r"####\s*([-+]?\$?\d[\d,]*(?:\.\d+)?(?:\s*/\s*[-+]?\d[\d,]*)?%?)",
+        r"final answer\s*[:=]?\s*([-+]?\$?\d[\d,]*(?:\.\d+)?(?:\s*/\s*[-+]?\d[\d,]*)?%?)",
+        r"the answer is\s*([-+]?\$?\d[\d,]*(?:\.\d+)?(?:\s*/\s*[-+]?\d[\d,]*)?%?)",
+        r"answer\s*[:=]\s*([-+]?\$?\d[\d,]*(?:\.\d+)?(?:\s*/\s*[-+]?\d[\d,]*)?%?)",
+    ]
+
+    lower = text.lower()
+    for p in patterns:
+        matches = re.findall(p, lower, flags=re.IGNORECASE)
+        if matches:
+            val = _to_float_maybe(matches[-1])
+            if val is not None:
+                return val
+
+    candidates = re.findall(
+        r"[-+]?\$?\d[\d,]*(?:\.\d+)?(?:\s*/\s*[-+]?\d[\d,]*)?%?",
+        text,
+    )
+
+    for cand in reversed(candidates):
+        val = _to_float_maybe(cand)
+        if val is not None:
+            return val
+
+    return None
+
+
+def extract_final_choice(text: str, n_choices: int) -> Optional[str]:
+    """
+    Extract final MCQ choice letter robustly.
+
+    Supports:
+    - Final answer: C
+    - Final answer: (C)
+    - Answer: C.
+    - The correct answer is C
+    - Option C
+    - choose C / answer：C
+    - \\boxed{C}
+    """
+    if not text or n_choices <= 0:
+        return None
+
+    valid = CHOICE_LETTERS[:n_choices]
+    valid_group = "".join(valid)
+
+    raw = str(text)
+    lower = raw.lower()
+
+    # Handle boxed answers first
+    boxed_patterns = [
+        rf"\\boxed\s*\{{\s*([{valid_group}{valid_group.lower()}])\s*\}}",
+        rf"boxed\s*\{{\s*([{valid_group}{valid_group.lower()}])\s*\}}",
+    ]
+    for p in boxed_patterns:
+        matches = re.findall(p, raw, flags=re.IGNORECASE)
+        if matches:
+            return matches[-1].upper()
+
+    # Strong final-answer patterns
+    patterns = [
+        rf"final\s+answer\s*[:：=]?\s*\(?\s*([{valid_group}])\s*\)?\b",
+        rf"final\s+choice\s*[:：=]?\s*\(?\s*([{valid_group}])\s*\)?\b",
+        rf"answer\s*[:：=]?\s*\(?\s*([{valid_group}])\s*\)?\b",
+        rf"答案\s*[:：=]?\s*\(?\s*([{valid_group}])\s*\)?\b",
+        rf"最终答案\s*[:：=]?\s*\(?\s*([{valid_group}])\s*\)?\b",
+        rf"the\s+answer\s+is\s*\(?\s*([{valid_group}])\s*\)?\b",
+        rf"the\s+correct\s+answer\s+is\s*\(?\s*([{valid_group}])\s*\)?\b",
+        rf"correct\s+answer\s*[:：=]?\s*\(?\s*([{valid_group}])\s*\)?\b",
+        rf"option\s*\(?\s*([{valid_group}])\s*\)?\b",
+        rf"choice\s*\(?\s*([{valid_group}])\s*\)?\b",
+        rf"选\s*\(?\s*([{valid_group}])\s*\)?",
+        rf"选择\s*\(?\s*([{valid_group}])\s*\)?",
+        rf"\b([{valid_group}])\b\s+is\s+correct",
+        rf"\b([{valid_group}])\b\s+is\s+the\s+correct\s+answer",
+    ]
+
+    for p in patterns:
+        matches = re.findall(p, raw, flags=re.IGNORECASE)
+        if matches:
+            return matches[-1].upper()
+
+    # Inspect last few non-empty lines.
+    # This catches outputs like:
+    # reasoning...
+    # C
+    lines = [x.strip() for x in raw.strip().splitlines() if x.strip()]
+    tail_lines = lines[-6:]
+
+    for line in reversed(tail_lines):
+        clean = line.strip()
+
+        # Examples: C / (C) / C. / C) / C:
+        m = re.fullmatch(
+            rf"\(?\s*([{valid_group}])\s*\)?[\.\):：]?",
+            clean,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            return m.group(1).upper()
+
+        # Examples: Final answer: **C**
+        clean2 = re.sub(r"[*_`]", "", clean)
+        m = re.search(
+            rf"(final\s+answer|answer|答案|最终答案)\s*[:：=]?\s*\(?\s*([{valid_group}])\s*\)?",
+            clean2,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            return m.group(2).upper()
+
+    # Conservative fallback:
+    # only look at final 500 chars, not whole solution,
+    # to avoid matching option labels in the question.
+    tail = raw[-500:]
+    fallback_patterns = [
+        rf"\(([{valid_group}])\)",
+        rf"\b([{valid_group}])\b",
+    ]
+
+    for p in fallback_patterns:
+        matches = re.findall(p, tail, flags=re.IGNORECASE)
+        if matches:
+            return matches[-1].upper()
+
+    return None
+
+
+def extract_final_text(text: str) -> str:
+    """
+    Extract final free-form answer text.
+
+    More robust for:
+    - Final answer: xxx
+    - Answer: xxx
+    - The answer is xxx
+    - 答案：xxx
+    - boxed answers
+    """
+    if not text:
+        return ""
+
+    raw = str(text).strip()
+
+    # Boxed answer
+    boxed = re.findall(r"\\boxed\s*\{([^{}]+)\}", raw, flags=re.IGNORECASE)
+    if boxed:
+        return boxed[-1].strip()
+
+    patterns = [
+        r"final\s+answer\s*[:：=]\s*(.+)",
+        r"final\s+answer\s+is\s+(.+)",
+        r"answer\s*[:：=]\s*(.+)",
+        r"the\s+answer\s+is\s+(.+)",
+        r"therefore\s*,?\s*the\s+answer\s+is\s+(.+)",
+        r"答案\s*[:：=]\s*(.+)",
+        r"最终答案\s*[:：=]\s*(.+)",
+    ]
+
+    for p in patterns:
+        matches = re.findall(p, raw, flags=re.IGNORECASE)
+        if matches:
+            ans = matches[-1].strip()
+            # Only take first line after the answer prefix
+            ans = ans.splitlines()[0].strip()
+            return ans.strip(" \t\n\r.。,:;；!！?？")
+
+    lines = [x.strip() for x in raw.splitlines() if x.strip()]
+    if not lines:
+        return raw
+
+    # Prefer the final non-empty line.
+    return lines[-1].strip(" \t\n\r.。,:;；!！?？")
+
+
+def check_answer(
+    solution: str,
+    ground_truth: str,
+    answer_type: str = "exact",
+    choices: Optional[List[str]] = None,
+    tolerance: float = 1e-2,
+) -> bool:
+    """
+    Robust but not overly permissive answer checker.
+
+    Main goals:
+    - MCQ: reliably extract final option letter.
+    - Numeric: compare numeric values with tolerance.
+    - Exact: support BBH-style short answers, booleans, simple text normalization.
+    """
+    choices = choices or []
+    solution = "" if solution is None else str(solution)
+    ground_truth = "" if ground_truth is None else str(ground_truth)
+
+    # ------------------------------------------------------------
+    # Multiple choice
+    # ------------------------------------------------------------
+    if answer_type == "mcq":
+        n_choices = len(choices)
+
+        # Normalize gold letter
+        gold_letter = None
+        if n_choices > 0:
+            gold_letter = _answer_to_letter(ground_truth, choices)
+
+        if gold_letter is None:
+            gt = ground_truth.strip()
+            if gt:
+                # Supports "C", "(C)", "C.", "answer: C"
+                m = re.search(
+                    rf"\b([{''.join(CHOICE_LETTERS[:max(n_choices, 4)])}])\b",
+                    gt,
+                    flags=re.IGNORECASE,
+                )
+                if m:
+                    gold_letter = m.group(1).upper()
+                else:
+                    gold_letter = gt[:1].upper()
+
+        if not gold_letter:
+            return False
+
+        # Extract predicted letter
+        pred_letter = extract_final_choice(solution, n_choices if n_choices > 0 else 4)
+
+        if pred_letter is not None:
+            return pred_letter == gold_letter
+
+        # Fallback: compare final text with correct option text
+        if choices and gold_letter in CHOICE_LETTERS[:len(choices)]:
+            gold_idx = CHOICE_LETTERS.index(gold_letter)
+            gold_text = normalize_text(choices[gold_idx])
+            pred_text = normalize_text(extract_final_text(solution))
+
+            if pred_text == gold_text:
+                return True
+
+            # Allow the final answer line to contain the correct option text
+            # but avoid allowing extremely short accidental matches.
+            if len(gold_text) >= 8 and gold_text in pred_text:
+                return True
+
+        return False
+
+    # ------------------------------------------------------------
+    # Numeric
+    # ------------------------------------------------------------
+    if answer_type == "numeric":
+        pred = extract_final_number(solution)
+        gold = extract_final_number(str(ground_truth))
+
+        if pred is None or gold is None:
+            return False
+
+        return math.isclose(pred, gold, abs_tol=tolerance, rel_tol=1e-4)
+
+    # ------------------------------------------------------------
+    # Exact / free-form
+    # ------------------------------------------------------------
+    pred_raw = extract_final_text(solution)
+    gold_raw = ground_truth
+
+    pred = normalize_text(pred_raw)
+    gold = normalize_text(gold_raw)
+
+    if not pred or not gold:
+        return False
+
+    # Exact normalized match
+    if pred == gold:
+        return True
+
+    # Boolean normalization
+    bool_map = {
+        "yes": "true",
+        "y": "true",
+        "true": "true",
+        "t": "true",
+        "1": "true",
+        "no": "false",
+        "n": "false",
+        "false": "false",
+        "f": "false",
+        "0": "false",
+    }
+
+    if pred in bool_map and gold in bool_map:
+        return bool_map[pred] == bool_map[gold]
+
+    # Numeric fallback for exact-type tasks
+    pred_num = extract_final_number(pred_raw)
+    gold_num = extract_final_number(gold_raw)
+    if pred_num is not None and gold_num is not None:
+        if math.isclose(pred_num, gold_num, abs_tol=tolerance, rel_tol=1e-4):
+            return True
+
+    # Strip common option-like wrappers for exact answers
+    pred2 = re.sub(r"^\(?[a-z]\)?[\.\):：]\s*", "", pred).strip()
+    gold2 = re.sub(r"^\(?[a-z]\)?[\.\):：]\s*", "", gold).strip()
+
+    if pred2 == gold2:
+        return True
+
+    # Short-answer containment.
+    # This is useful for BBH tasks where final line may be:
+    # "Final answer: the correct object is the apple"
+    # while gold is "apple".
+    #
+    # Keep it conservative:
+    # - gold <= 5 words
+    # - gold length >= 2
+    # - match as phrase boundary when possible
+    if len(gold2) >= 2 and len(gold2.split()) <= 5:
+        escaped = re.escape(gold2)
+        if re.search(rf"(^|[^a-zA-Z0-9]){escaped}([^a-zA-Z0-9]|$)", pred2):
+            return True
+
+        # Also allow final text ending with gold.
+        if pred2.endswith(gold2):
+            return True
+
+    # Some BBH answers are comma-separated or list-like.
+    # Normalize simple punctuation variants.
+    pred_compact = re.sub(r"[\s,;，；]+", " ", pred2).strip()
+    gold_compact = re.sub(r"[\s,;，；]+", " ", gold2).strip()
+
+    if pred_compact == gold_compact:
+        return True
+
+    return False
+
+def extract_predicted_answer(
+    solution: str,
+    answer_type: str,
+    choices: Optional[List[str]] = None,
+):
+    choices = choices or []
+
+    if answer_type == "mcq":
+        return extract_final_choice(solution, len(choices))
+
+    if answer_type == "numeric":
+        return extract_final_number(solution)
+
+    return extract_final_text(solution)
+
+
+# ---------------------------------------------------------------------
+# Main single-problem runner
+# ---------------------------------------------------------------------
+
+def run_single_problem(
+    problem: Dict[str, Any],
+    method: str,
+    memory: Optional[ExperienceMemory],
+    max_iterations: int = 3,
+    is_training: bool = False,
+    initial_solution: Optional[str] = None,
+    sim_threshold: float = SIMILARITY_THRESHOLD,
+    top_k_experiences: int = DEFAULT_TOP_K,
+    use_retrieval: bool = True,
+    use_adaptive_iter: bool = True,
+    use_gradient_injection: bool = True,
+    initial_temperature: float = 0.0,
+) -> Dict[str, Any]:
+    _begin_api_count()
     start_total = time.time()
-    initial_solution = generate_initial_solution(question)
+
+    p = normalize_problem(problem)
+
+    question = p["question"]
+    ground_truth = p["answer"]
+    answer_type = p["answer_type"]
+    choices = p["choices"]
+    metadata = p["metadata"]
+
+    if initial_solution is None:
+        initial_solution = generate_initial_solution(
+            problem,
+            temperature=initial_temperature,
+        )
+
     init_time = time.time() - start_total
 
-    solution = tg.Variable(initial_solution,
-                           role_description="step-by-step math solution",
-                           requires_grad=True)
-    loss_fn = create_loss_function()
+    solution = tg.Variable(
+        initial_solution,
+        role_description="candidate benchmark solution",
+        requires_grad=True,
+    )
+
+    loss_fn = create_loss_function(answer_type=answer_type)
+
+    predicted_iters = None
+    retrieved_count = 0
+    retrieved_similarities = []
 
     if method == "vanilla":
         optimizer = tg.TGD(parameters=[solution])
         actual_max_iters = max_iterations
-        predicted_iters = None
-    else:
+
+    elif method == "mat":
         optimizer = MemoryAugmentedTGD(
             parameters=[solution],
             memory=memory,
-            top_k_experiences=1,
-            sim_threshold=SIMILARITY_THRESHOLD
+            top_k_experiences=top_k_experiences,
+            sim_threshold=sim_threshold,
+            use_retrieval=use_retrieval,
+            use_adaptive_iter=use_adaptive_iter,
+            use_gradient_injection=use_gradient_injection,
         )
-        optimizer.set_problem(question)
-        predicted_iters = optimizer.predict_required_iterations()
-        actual_max_iters = min(max_iterations, predicted_iters + 1)
 
-    api_calls = 1  # 初始解
-    loop_start = time.time()
+        optimizer.set_problem(
+            problem_text=question,
+            answer_type=answer_type,
+            metadata=metadata,
+        )
+
+        predicted_iters = optimizer.predicted_iters
+        retrieved_count = len(optimizer.retrieved_experiences)
+        retrieved_similarities = optimizer.retrieved_similarities
+
+        if predicted_iters is not None:
+            actual_max_iters = min(max_iterations, max(1, predicted_iters + 1))
+        else:
+            actual_max_iters = max_iterations
+
+    else:
+        raise ValueError(f"Unknown method: {method}")
+
     success = False
     final_solution = initial_solution
-    num_iters = 0
+    num_iterations = 0
     iterations_log = []
 
+    loop_start = time.time()
+
     for i in range(actual_max_iters):
-        if check_answer(solution.value, ground_truth):
+        if check_answer(
+            solution=solution.value,
+            ground_truth=ground_truth,
+            answer_type=answer_type,
+            choices=choices,
+        ):
             success = True
             final_solution = solution.value
-            num_iters = i
+            num_iterations = i
             break
 
         loss = loss_fn(solution)
-        api_calls += 1
         loss.backward()
-        api_calls += 1
 
-        iterations_log.append({
-            "iteration": i+1,
-            "solution": solution.value[:200],
-            "gradient": str(solution.gradients)[:200] if solution.gradients else ""
-        })
+        iterations_log.append(
+            {
+                "iteration": i + 1,
+                "solution_preview": str(solution.value)[:700],
+                "gradient_preview": str(solution.gradients)[:700],
+            }
+        )
 
         optimizer.step()
-        api_calls += 1
 
     if not success:
         final_solution = solution.value
-        num_iters = actual_max_iters
-        success = check_answer(solution.value, ground_truth)
+        num_iterations = actual_max_iters
+        success = check_answer(
+            solution=solution.value,
+            ground_truth=ground_truth,
+            answer_type=answer_type,
+            choices=choices,
+        )
 
     loop_time = time.time() - loop_start
     total_time = init_time + loop_time
 
+    stored = False
+
     if is_training and success and method == "mat":
-        optimizer.record_success(final_solution=final_solution,
-                                 initial_solution=initial_solution)
+        stored = optimizer.record_success(
+            final_solution=final_solution,
+            initial_solution=initial_solution,
+        )
 
     return {
         "method": method,
-        "question": question[:200],
+        "question": question,
+        "question_preview": question[:300],
+        "raw_question": p["raw_question"],
+        "ground_truth": ground_truth,
+        "answer_type": answer_type,
+        "choices": choices,
+        "metadata": metadata,
+        "problem_type": infer_problem_type(question, metadata),
         "initial_solution": initial_solution,
         "final_solution": final_solution,
+        "predicted_answer": extract_predicted_answer(final_solution, answer_type, choices),
         "success": success,
-        "num_iterations": num_iters,
-        "api_calls": api_calls,
-        "time": total_time,
-        "predicted_iter": predicted_iters if method == "mat" else None,
-        "iterations_log": iterations_log
+        "num_iterations": num_iterations,
+        "actual_max_iterations": actual_max_iters,
+        "api_calls": _get_api_count(),
+        "time": round(total_time, 4),
+        "predicted_iter": predicted_iters,
+        "retrieved_count": retrieved_count,
+        "retrieved_similarities": retrieved_similarities,
+        "stored_to_memory": stored,
+        "use_retrieval": use_retrieval,
+        "use_adaptive_iter": use_adaptive_iter,
+        "use_gradient_injection": use_gradient_injection,
+        "sim_threshold": sim_threshold,
+        "iterations_log": iterations_log,
     }
-
-# ============================================================
-# 两阶段实验
-# ============================================================
-
-def run_two_phase_experiment(train_problems: List[dict],
-                             test_problems: List[dict],
-                             max_iterations: int = 3):
-    print("=" * 70)
-    print("🚀 两阶段实验：训练(积累记忆) → 测试(对比泛化)")
-    print("=" * 70)
-
-    # ---------- 阶段1：训练 MAT ----------
-    print("\n📚 阶段1：训练 MAT (积累记忆)")
-    print("-" * 50)
-    memory = ExperienceMemory(capacity=500)
-    for i, prob in enumerate(train_problems):
-        print(f"训练 {i+1}/{len(train_problems)}: {prob['question'][:50]}...")
-        res = run_single_problem(prob, method="mat", memory=memory,
-                                 max_iterations=max_iterations, is_training=True)
-        status = "✓" if res["success"] else "✗"
-        print(f"  {status} 迭代: {res['num_iterations']}, API: {res['api_calls']}, 耗时: {res['time']:.2f}s")
-
-    print(f"\n📊 训练完成，记忆库存储 {memory.stats['total_stored']} 条成功经验")
-
-    # ---------- 阶段2：测试对比 ----------
-    print("\n🧪 阶段2：测试对比 (Vanilla vs MAT)")
-    print("-" * 50)
-    all_test_results = {"vanilla": [], "mat": []}
-
-    for method in ["vanilla", "mat"]:
-        print(f"\n--- 测试方法: {method.upper()} ---")
-        for i, prob in enumerate(test_problems):
-            print(f"测试 {i+1}/{len(test_problems)}: {prob['question'][:50]}...")
-            res = run_single_problem(prob, method=method,
-                                     memory=memory if method == "mat" else None,
-                                     max_iterations=max_iterations, is_training=False)
-            all_test_results[method].append(res)
-            status = "✓" if res["success"] else "✗"
-            pred = res.get("predicted_iter")
-            pred_str = f"预测={pred}" if pred is not None else ""
-            print(f"  {status} 迭代: {res['num_iterations']} {pred_str} API: {res['api_calls']} 耗时: {res['time']:.2f}s")
-
-    # ---------- 汇总报告 ----------
-    print("\n" + "=" * 70)
-    print("📈 测试阶段最终对比")
-    print("=" * 70)
-
-    summary = {}
-    for method, res_list in all_test_results.items():
-        successes = sum(1 for r in res_list if r["success"])
-        total = len(res_list)
-        iters = [r["num_iterations"] for r in res_list]
-        apis = [r["api_calls"] for r in res_list]
-        times = [r["time"] for r in res_list]
-        summary[method] = {
-            "accuracy": successes / total,
-            "avg_iterations": np.mean(iters),
-            "avg_api_calls": np.mean(apis),
-            "avg_time": np.mean(times)
-        }
-        print(f"\n{method.upper()}:")
-        print(f"  准确率: {successes}/{total} ({100*successes/total:.1f}%)")
-        print(f"  平均迭代次数: {np.mean(iters):.2f}")
-        print(f"  平均 API 调用: {np.mean(apis):.2f}")
-        print(f"  平均耗时 (秒): {np.mean(times):.2f}")
-
-    # 保存详细结果
-    with open("phase2_test_results.json", "w", encoding="utf-8") as f:
-        json.dump(all_test_results, f, indent=2, ensure_ascii=False)
-    memory.save("memory_after_training.json")
-    print("\n✅ 详细结果已保存至 phase2_test_results.json 和 memory_after_training.json")
-
-    # 绘制对比图
-    if HAS_PLT:
-        plot_comparison(summary)
-    else:
-        print("⚠️ matplotlib 未安装，跳过绘图。")
-
-    return all_test_results, summary
-
-def plot_comparison(summary: dict):
-    """绘制 Vanilla vs MAT 的柱状对比图"""
-    methods = list(summary.keys())
-    acc = [summary[m]["accuracy"] * 100 for m in methods]
-    iters = [summary[m]["avg_iterations"] for m in methods]
-    apis = [summary[m]["avg_api_calls"] for m in methods]
-    times = [summary[m]["avg_time"] for m in methods]
-
-    fig, axes = plt.subplots(1, 4, figsize=(14, 3))
-    axes[0].bar(methods, acc, color=['skyblue', 'salmon'])
-    axes[0].set_title("Accuracy (%)")
-    axes[0].set_ylim(0, 100)
-
-    axes[1].bar(methods, iters, color=['skyblue', 'salmon'])
-    axes[1].set_title("Avg Iterations")
-
-    axes[2].bar(methods, apis, color=['skyblue', 'salmon'])
-    axes[2].set_title("Avg API Calls")
-
-    axes[3].bar(methods, times, color=['skyblue', 'salmon'])
-    axes[3].set_title("Avg Time (s)")
-
-    plt.tight_layout()
-    plt.savefig("comparison_plot.png", dpi=150)
-    print("📊 对比图已保存为 comparison_plot.png")
-
-# ============================================================
-# 题目数据集
-# ============================================================
-
-TRAIN_PROBLEMS = [
-    {"question": "Janet's ducks lay 16 eggs per day. She eats 3 and uses 4 for muffins. Sells the rest at $2 each. Daily earnings?", "answer": "18"},
-    {"question": "A robe takes 2 bolts blue fiber and half that white. Total bolts?", "answer": "3"},
-    {"question": "Josh buys house for $80k, repairs $50k, value up 150%. Profit?", "answer": "70000"},
-    {"question": "James runs 3 sprints 3x/week, 60m each. Total meters per week?", "answer": "540"},
-    {"question": "Wendi has 20 chickens, 3 cups/day each. Morning 15, afternoon 25. Final meal cups?", "answer": "20"},
-    {"question": "Tom has 8 boxes of 24 crayons. Gives 15 to sister, rest to 5 friends. Each friend gets?", "answer": "37"},
-    {"question": "Bakery sells muffins in packs of 4 and 6. Sarah buys 3 packs of 4 and 2 of 6. Total?", "answer": "24"},
-    {"question": "Theater: 12 rows of 18 seats. 157 occupied. Empty seats?", "answer": "59"},
-    {"question": "Lisa reads 240 pages: 25 Mon, 30 Tue, twice Tue on Wed. Pages left?", "answer": "125"},
-    {"question": "Farmer has 150 apples, sells 45, divides rest into 7 baskets. Apples per basket?", "answer": "15"},
-]
-
-TEST_PROBLEMS = [
-    {"question": "Michael earns $12 per hour. Works 8h Mon, 6h Tue, 9h Wed. Total earnings?", "answer": "276"},
-    {"question": "Rectangular garden 15m by 8m. Fencing costs $9 per meter. Total cost?", "answer": "414"},
-    {"question": "Emma has 120 stickers. Gives 1/3 to brother, buys 25 more. How many now?", "answer": "105"},
-    {"question": "Car travels at 65 mph for 3.5 hours. Distance?", "answer": "227.5"},
-    {"question": "28 students split into groups of 4. How many groups?", "answer": "7"},
-    {"question": "Store sells pencils in packs of 10 and 15. John buys 4 packs of 10 and 2 of 15. Total?", "answer": "70"},
-    {"question": "Pizza cut into 8 slices. 3 friends eat 2 slices each. Left?", "answer": "2"},
-    {"question": "Train travels 300 miles in 5 hours. Average speed?", "answer": "60"},
-    {"question": "Samantha has $50. Buys book $18 and toy $22. Left?", "answer": "10"},
-    {"question": "School orders 15 boxes of pencils, 24 per box. Gives 100 to students. Left?", "answer": "260"},
-    {"question": "Baker makes 240 cookies, packs in bags of 8. How many bags?", "answer": "30"},
-    {"question": "Movie starts 7:30pm, lasts 2h 15m. End time?", "answer": "9:45"},
-    {"question": "Rectangle length 12cm, width 5cm. Area?", "answer": "60"},
-    {"question": "Tank holds 500L, filled at 25L/min. Time to fill?", "answer": "20"},
-    {"question": "Lily reads 35 pages/day. Pages in 12 days?", "answer": "420"},
-    {"question": "Shirt costs $25, 20% discount. Sale price?", "answer": "20"},
-    {"question": "Bus has 45 seats, 38 occupied. Empty seats?", "answer": "7"},
-    {"question": "David runs 5km in 25 min. Speed in km/h?", "answer": "12"},
-    {"question": "Cake recipe needs 3 eggs. Eggs for 5 cakes?", "answer": "15"},
-    {"question": "Phone costs $600, 15% off. Discount amount?", "answer": "90"},
-    {"question": "John saves $50 per week. After 8 weeks, buys $120 bike. Left?", "answer": "280"},
-    {"question": "Class has 18 boys and 12 girls. Ratio boys to total?", "answer": "0.6"},
-    {"question": "Book has 350 pages. Read 120 pages. Pages left to read 50%?", "answer": "175"},
-    {"question": "Fruit basket: 8 apples, 6 oranges, 4 bananas. Fraction of apples?", "answer": "0.44"},
-    {"question": "Train leaves at 9:15, arrives 11:45. Travel time in minutes?", "answer": "150"},
-    {"question": "Painter paints 3 rooms in 2 days. Rooms in 10 days?", "answer": "15"},
-    {"question": "Water bill $45, electric bill 2.5 times water. Total?", "answer": "157.5"},
-    {"question": "Garden area 120 sq ft, length 12 ft. Width?", "answer": "10"},
-    {"question": "Sale: 30% off $80 jacket. Final price?", "answer": "56"},
-    {"question": "Recipe uses 2 cups flour for 12 muffins. Flour for 30 muffins?", "answer": "5"},
-]
-
-# ============================================================
-# 主入口
-# ============================================================
-
-if __name__ == "__main__":
-    # 初始化 TextGrad 引擎
-    print("[Setup] Configuring DeepSeek engine for TextGrad...")
-    setup_textgrad_with_deepseek()
-
-    # 运行两阶段实验
-    run_two_phase_experiment(TRAIN_PROBLEMS, TEST_PROBLEMS, max_iterations=3)
-
